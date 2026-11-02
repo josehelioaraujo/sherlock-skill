@@ -182,3 +182,165 @@ var order = await db.GetOrderAsync(orderId, ct);
 if (order is null || order.CustomerId != authenticatedCustomerId)
     return Results.NotFound(); // nunca 403 — não confirmar existência
 ```
+
+---
+
+## PERF — Memory Leak / Performance
+
+```
+□ Configurar memory limit no Kubernetes e alerta em > 80%
+□ dotnet-counters em CI: validar que GC Gen2 não cresce em carga
+□ Revisar todo código com IDisposable: usar using ou DisposeAsync
+□ Cache local: sempre definir tamanho máximo (MemoryCache com SizeLimit)
+□ Event handlers: sempre desinscrever (−= ou WeakReference)
+□ Static collections: nunca crescer indefinidamente — use bounded queue
+□ HTTP clients: usar IHttpClientFactory (nunca new HttpClient() manual)
+□ Streams e arquivos: sempre fechar com using — nunca ler tudo em memória
+□ Teste de soak: rodar carga por 30+ minutos e monitorar memória
+□ Alerta: GC Gen2 count crescendo por mais de 10 minutos
+```
+
+**Exemplo de bounded cache (.NET):**
+```csharp
+// MemoryCache com limite de tamanho
+services.AddMemoryCache(options =>
+{
+    options.SizeLimit = 1024; // máximo 1024 entradas
+});
+
+// Ao inserir — sempre com tamanho
+cache.Set(key, value, new MemoryCacheEntryOptions
+{
+    AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5),
+    Size = 1
+});
+```
+
+**Exemplo de HTTP client correto (.NET):**
+```csharp
+// ❌ Errado — socket exhaustion após ~60s
+var client = new HttpClient();
+
+// ✅ Correto — pool gerenciado pelo factory
+services.AddHttpClient<IMyService, MyService>();
+```
+
+---
+
+## DEPLOY — Regressão de Deploy
+
+```
+□ Feature flags para rollout gradual (0% → 10% → 50% → 100%)
+□ Smoke tests automáticos pós-deploy antes de promover para prod
+□ Canary deploy: rotear 5% do tráfego para nova versão antes de 100%
+□ Rollback automático se error rate > X% nos primeiros 5 minutos após deploy
+□ Checklist de deploy: migrations? variáveis novas? breaking changes de API?
+□ Blue-green ou rolling update com maxUnavailable=0
+□ Changelog legível: todo PR documenta o que mudou e o impacto esperado
+□ Alertas sensíveis nos 15 minutos após cada deploy (janela de atenção)
+□ Lock de deploy em horário de pico (ex: não deployar sexta 17h-20h)
+□ Testes de contrato (contract tests) para quebras silenciosas de API
+```
+
+**Exemplo de rollback automático (GitHub Actions):**
+```yaml
+- name: Verify deploy health
+  run: |
+    sleep 60
+    ERROR_RATE=$(curl -s "$PROMETHEUS/api/v1/query" \
+      --data-urlencode 'query=rate(http_requests_total{status=~"5.."}[2m])' | jq '.data.result[0].value[1]')
+    if (( $(echo "$ERROR_RATE > 0.05" | bc -l) )); then
+      echo "Error rate $ERROR_RATE > 5% — triggering rollback"
+      kubectl rollout undo deployment/$SERVICE -n production
+      exit 1
+    fi
+```
+
+---
+
+## QUEUE — Fila / Mensageria
+
+```
+□ Dead Letter Queue (DLQ) configurada para mensagens que falham N vezes
+□ Alerta: consumer lag > threshold por mais de 5 minutos
+□ Alerta: mensagens na DLQ > 0 (qualquer poison message é crítico)
+□ Partition count = número máximo de consumers paralelos planejados
+□ Monitore rebalances: muitos rebalances = consumers instáveis
+□ enable.auto.commit=false + commit explícito APÓS processamento bem-sucedido
+□ Max poll records baixo (50–200) para evitar timeout de sessão em processamento lento
+□ Backpressure: se downstream lento, reduza poll records ou pause o consumer
+□ Retry com backoff na mensagem antes de enviar para DLQ
+□ Schema registry ou contrato de mensagem documentado para evitar breaking change
+```
+
+**Exemplo de consumer Kafka robusto (.NET + Confluent):**
+```csharp
+consumer.Subscribe(topic);
+while (!ct.IsCancellationRequested)
+{
+    var msg = consumer.Consume(ct);
+    try
+    {
+        await handler.HandleAsync(msg.Value, ct);
+        consumer.Commit(msg);          // commit APÓS sucesso
+    }
+    catch (TransientException ex)
+    {
+        logger.LogWarning(ex, "Transient error — will retry");
+        // não commita → Kafka reentregará
+    }
+    catch (PoisonMessageException ex)
+    {
+        logger.LogError(ex, "Poison message {Key} — sending to DLQ", msg.Key);
+        await dlq.PublishAsync(msg.Value, ct);
+        consumer.Commit(msg);          // commita para não travar a partição
+    }
+}
+```
+
+---
+
+## BUSINESS — Lógica de Negócio
+
+```
+□ Testes de contrato para cada regra de negócio crítica (tabela de decisão)
+□ Testes com valores reais de casos de borda: R$0, desconto > total, frete grátis + cupom
+□ Decimal (não float/double) para todos os cálculos financeiros
+□ State machine explícita para transições de status (nunca if-else solto)
+□ Audit log em todas as tabelas financeiras (orders, payments, invoices)
+□ Validação de estado válido antes de cada transição
+□ Documentar regras de negócio no código (comment + link para spec)
+□ Alerta: valor calculado fora de range esperado (pedido com total negativo, desconto > 100%)
+□ Testes de regressão automáticos para cada bug de negócio corrigido
+```
+
+**Exemplo de state machine (.NET):**
+```csharp
+public static class OrderStatusTransitions
+{
+    private static readonly Dictionary<OrderStatus, HashSet<OrderStatus>> _allowed = new()
+    {
+        [OrderStatus.Created]    = [OrderStatus.Paid, OrderStatus.Cancelled],
+        [OrderStatus.Paid]       = [OrderStatus.Processing, OrderStatus.Refunded],
+        [OrderStatus.Processing] = [OrderStatus.Shipped],
+        [OrderStatus.Shipped]    = [OrderStatus.Delivered],
+    };
+
+    public static void ValidateTransition(OrderStatus from, OrderStatus to)
+    {
+        if (!_allowed.TryGetValue(from, out var allowed) || !allowed.Contains(to))
+            throw new InvalidOperationException(
+                $"Invalid order status transition: {from} → {to}");
+    }
+}
+```
+
+**Cálculo financeiro correto:**
+```csharp
+// ❌ Errado — float acumula erro
+float total = 0.1f + 0.2f; // = 0.30000001192092896
+
+// ✅ Correto — decimal para dinheiro
+decimal total = 0.1m + 0.2m; // = 0.3
+decimal discounted = Math.Round(total * (1 - discountRate), 2, MidpointRounding.AwayFromZero);
+```
